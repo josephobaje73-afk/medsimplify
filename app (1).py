@@ -569,7 +569,7 @@ class AITranslator:
     )
     _MAX_CHAT_HISTORY_TURNS: int = 20
 
-    def __init__(self, api_key: str, model: str = "gemini-2.0-flash"):
+    def __init__(self, api_key: str, model: str = "gemini-3.8-flash"):
         if not api_key:
             raise AITranslationError("No Gemini API key was provided.")
         self.api_key: str = api_key
@@ -930,7 +930,7 @@ class UserStore:
         wrong current password)."""
         # Re-uses authenticate()'s constant-time comparison and its
         # deliberately generic error message.
-        self.authenticate(username, current_password)
+        _ = self.authenticate(username, current_password)
 
         if len(new_password) < self._MIN_PASSWORD_LENGTH:
             raise InvalidCredentialsError(
@@ -1165,7 +1165,7 @@ def render_search_suggestions(session_state: dict[str, object], drug_name_input:
             session_state["drug_name_input"] = selected
             session_state["trigger_search"] = True
 
-    cast(Callable[..., object], getattr(cast(object, st), "selectbox"))(
+    _ = cast(Callable[..., object], getattr(cast(object, st), "selectbox"))(
         "Did you mean:",
         options,
         key=dropdown_key,
@@ -1177,13 +1177,16 @@ def render_auth_ui(user_store: UserStore, session_state: dict[str, object]) -> N
     """Render the sign-in / sign-up screen. On success, stores the
     logged-in username in session_state and reruns the app so main()
     picks up the logged-in branch on the next execution."""
-    cast(Callable[[str], object], getattr(cast(object, st), "subheader"))(
+    _ = cast(Callable[[str], object], getattr(cast(object, st), "subheader"))(
         "Sign in to continue"
     )
 
     tabs = cast(_StreamlitTabsFactoryAPI, cast(object, st)).tabs(["Sign In", "Sign Up"])
 
     # --- Sign In ---------------------------------------------------------
+    sign_in_submitted = False
+    sign_in_username = ""
+    sign_in_password = ""
     with tabs[0]:
         with cast(_StreamlitFormFactoryAPI, cast(object, st)).form("sign_in_form"):
             sign_in_username = cast(
@@ -1203,9 +1206,13 @@ def render_auth_ui(user_store: UserStore, session_state: dict[str, object]) -> N
                 _ = cast(_StreamlitErrorAPI, cast(object, st)).error(str(exc))
             else:
                 session_state["logged_in_user"] = user.username
-                cast(Callable[[], object], getattr(cast(object, st), "rerun"))()
+                _ = cast(Callable[[], object], getattr(cast(object, st), "rerun"))()
 
     # --- Sign Up -----------------------------------------------------------
+    sign_up_submitted = False
+    sign_up_username = ""
+    sign_up_password = ""
+    sign_up_confirm = ""
     with tabs[1]:
         with cast(_StreamlitFormFactoryAPI, cast(object, st)).form("sign_up_form"):
             sign_up_username = cast(
@@ -1231,7 +1238,7 @@ def render_auth_ui(user_store: UserStore, session_state: dict[str, object]) -> N
                 _ = cast(_StreamlitSuccessAPI, cast(object, st)).success(
                     f"Account created — welcome, {user.username}!"
                 )
-                cast(Callable[[], object], getattr(cast(object, st), "rerun"))()
+                _ = cast(Callable[[], object], getattr(cast(object, st), "rerun"))()
 
 
 def render_search_tab(history: SearchHistory, session_state: dict[str, object], api_key: str) -> None:
@@ -1298,7 +1305,7 @@ def render_search_tab(history: SearchHistory, session_state: dict[str, object], 
 
         missing = medication.has_missing_fields()
         if missing:
-            cast(Callable[[str], object], getattr(cast(object, st), "info"))(
+            _ = cast(Callable[[str], object], getattr(cast(object, st), "info"))(
                 "Note: the FDA label was missing data for: " + ", ".join(missing)
             )
 
@@ -1311,11 +1318,15 @@ def render_search_tab(history: SearchHistory, session_state: dict[str, object], 
             )
             recalls = []
 
-    cast(Callable[[str], object], getattr(cast(object, st), "subheader"))(
-        f"{medication.generic_name.title() or drug_name.title()}"
+    if medication is None:
+        return
+
+    display_name = medication.generic_name or drug_name
+    _ = cast(Callable[[str], object], getattr(cast(object, st), "subheader"))(
+        display_name.title()
     )
     if medication.brand_names:
-        cast(Callable[[str], object], getattr(cast(object, st), "caption"))(
+        _ = cast(Callable[[str], object], getattr(cast(object, st), "caption"))(
             "Brand names: " + ", ".join(medication.brand_names)
         )
 
@@ -1368,18 +1379,20 @@ def render_search_tab(history: SearchHistory, session_state: dict[str, object], 
         translator = AITranslator(api_key=api_key)
         for label, text in sections.items():
             markdown_fn(f"### {label}")
+            simple_text = ""
             try:
                 with cast(_StreamlitSpinnerFactoryAPI, cast(object, st)).spinner(
                     f"Simplifying '{label}'..."
                 ):
                     simple_text = translator.simplify(text, label)
-                write_fn.write(simple_text)
-                simplified[label] = simple_text
             except AITranslationError as exc:
                 _ = cast(_StreamlitErrorAPI, cast(object, st)).error(
                     f"Could not simplify this section: {exc}"
                 )
-                write_fn.write(text or "_No data available._")
+                _ = write_fn.write(text or "_No data available._")
+            else:
+                _ = write_fn.write(simple_text)
+                simplified[label] = simple_text
             time.sleep(0.2)  # gentle pacing between API calls
 
     # 5. Save to history
@@ -1437,13 +1450,14 @@ def render_chat_tab(chat_history: ChatHistory, api_key: str) -> None:
         cast(Callable[[str], object], getattr(cast(object, st), "markdown"))(user_message)
 
     translator = AITranslator(api_key=api_key)
+    reply = ""
     with chat_message_fn("assistant"):
         try:
             with cast(_StreamlitSpinnerFactoryAPI, cast(object, st)).spinner("Thinking..."):
                 reply = translator.chat(user_message, prior_turns)
         except AITranslationError as exc:
             reply = f"Sorry, I couldn't get a response right now: {exc}"
-        cast(Callable[[str], object], getattr(cast(object, st), "markdown"))(reply)
+        _ = cast(Callable[[str], object], getattr(cast(object, st), "markdown"))(reply)
 
     chat_history.add("model", reply)
 
@@ -1475,6 +1489,10 @@ def render_profile_tab(
         "Change password"
     )
 
+    password_submitted = False
+    current_password = ""
+    new_password = ""
+    confirm_new_password = ""
     with cast(_StreamlitFormFactoryAPI, cast(object, st)).form("change_password_form"):
         current_password = cast(
             Callable[..., str], getattr(cast(object, st), "text_input")
