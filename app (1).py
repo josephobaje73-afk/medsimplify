@@ -9,9 +9,10 @@ A Streamlit application that lets a user type a medication name and:
   4. Saves every search to a local JSON file so the user can revisit history
   5. Offers live "did you mean" name suggestions while the user types,
      powered by openFDA's cheap count-query mode
-  6. Provides doctor sign-up/sign-in and a doctor-only patient-care area
-     using professional details supplied during registration
-  7. Shows a Profile tab with account info, usage stats, and a
+  6. Lets patients submit symptom complaints to an available doctor
+  7. Uses Gemini to create a non-diagnostic triage summary for each complaint
+  8. Gives doctors a shared complaint inbox where they can claim and respond
+  9. Shows a Profile tab with account info, usage stats, and a
      change-password form
 
 Python concepts demonstrated (per assignment spec):
@@ -24,6 +25,7 @@ Python concepts demonstrated (per assignment spec):
                            ChatHistory, UserStore
 
 Tech stack: Python, Streamlit, Requests, JSON, Gemini API, openFDA APIs.
+Complaint routing and doctor availability are persisted in shared JSON files; Gemini provides the cloud-AI triage layer.
 
 Run with:
     streamlit run app.py
@@ -234,10 +236,6 @@ class InvalidCredentialsError(AuthenticationError):
     """Raised for empty/too-short input, or a username/password that
     doesn't match a stored account. Kept deliberately generic for
     sign-in failures so we never reveal whether a username exists."""
-
-
-class DoctorRegistrationError(AuthenticationError):
-    """Raised when required doctor-registration information is missing."""
 
 
 # ---------------------------------------------------------------------------
@@ -785,11 +783,6 @@ class User:
     password_hash: str 
     salt: str 
     created_at: str 
-    role: str = "user"
-    doctor_name: str = ""
-    license_number: str = ""
-    specialty: str = ""
-    certificate_name: str = ""
  
  
 class UserStore: 
@@ -879,79 +872,6 @@ class UserStore:
             created_at=created_at, 
         ) 
  
-    def register_doctor(
-        self,
-        username: str,
-        password: str,
-        confirm_password: str,
-        doctor_name: str,
-        license_number: str,
-        specialty: str,
-        certificate_name: str,
-    ) -> User:
-        """Create a doctor account and store supplied professional metadata.
-
-        The certificate file itself is not persisted by this method; only its
-        filename is recorded. Credential verification is outside this local app.
-        """
-        cleaned_username = username.strip()
-        cleaned_name = doctor_name.strip()
-        cleaned_license = license_number.strip()
-        cleaned_specialty = specialty.strip()
-        cleaned_certificate = certificate_name.strip()
-
-        if not cleaned_username:
-            raise InvalidCredentialsError("Username cannot be empty.")
-        if len(cleaned_username) > 50:
-            raise InvalidCredentialsError("Username is too long.")
-        if len(password) < self._MIN_PASSWORD_LENGTH:
-            raise InvalidCredentialsError(
-                f"Password must be at least {self._MIN_PASSWORD_LENGTH} characters long."
-            )
-        if password != confirm_password:
-            raise InvalidCredentialsError("Passwords do not match.")
-        if not cleaned_name:
-            raise DoctorRegistrationError("Enter your full professional name.")
-        if not cleaned_license:
-            raise DoctorRegistrationError("Enter your medical license or certificate number.")
-        if not cleaned_specialty:
-            raise DoctorRegistrationError("Enter your medical specialty.")
-        if not cleaned_certificate:
-            raise DoctorRegistrationError("Upload your professional certificate.")
-
-        users = self._read()
-        lookup_key = cleaned_username.lower()
-        if lookup_key in users:
-            raise UsernameTakenError(f'The username "{cleaned_username}" is already taken.')
-
-        salt_hex = secrets.token_hex(16)
-        password_hash = self._hash_password(password, salt_hex)
-        created_at = datetime.now().isoformat(timespec="seconds")
-        users[lookup_key] = {
-            "username": cleaned_username,
-            "password_hash": password_hash,
-            "salt": salt_hex,
-            "created_at": created_at,
-            "role": "doctor",
-            "doctor_name": cleaned_name,
-            "license_number": cleaned_license,
-            "specialty": cleaned_specialty,
-            "certificate_name": cleaned_certificate,
-        }
-        self._write(users)
-
-        return User(
-            username=cleaned_username,
-            password_hash=password_hash,
-            salt=salt_hex,
-            created_at=created_at,
-            role="doctor",
-            doctor_name=cleaned_name,
-            license_number=cleaned_license,
-            specialty=cleaned_specialty,
-            certificate_name=cleaned_certificate,
-        )
-
     def authenticate(self, username: str, password: str) -> User: 
         """Verify credentials against a stored account. Raises 
         InvalidCredentialsError on any mismatch — deliberately the same 
@@ -976,11 +896,6 @@ class UserStore:
             password_hash=stored_hash, 
             salt=stored_salt, 
             created_at=str(record.get("created_at", "")), 
-            role=str(record.get("role", "user")),
-            doctor_name=str(record.get("doctor_name", "")),
-            license_number=str(record.get("license_number", "")),
-            specialty=str(record.get("specialty", "")),
-            certificate_name=str(record.get("certificate_name", "")),
         ) 
  
     def get_user(self, username: str) -> User | None: 
@@ -1002,11 +917,6 @@ class UserStore:
             password_hash=stored_hash, 
             salt=stored_salt, 
             created_at=str(record.get("created_at", "")), 
-            role=str(record.get("role", "user")),
-            doctor_name=str(record.get("doctor_name", "")),
-            license_number=str(record.get("license_number", "")),
-            specialty=str(record.get("specialty", "")),
-            certificate_name=str(record.get("certificate_name", "")),
         ) 
  
     def change_password( 
@@ -1265,178 +1175,142 @@ def render_search_suggestions(session_state: dict[str, object], drug_name_input:
     ) 
  
  
-def render_auth_ui(user_store: UserStore, session_state: dict[str, object]) -> None:
-    """Render normal sign-in, doctor sign-in, normal sign-up, and doctor sign-up."""
+def render_auth_ui(user_store: UserStore, session_state: dict[str, object]) -> None: 
+    """Render the sign-in / doctor sign-in / sign-up screen. Doctor access 
+    requires normal account credentials plus a medical certificate/license 
+    number and an uploaded certificate before the app can be accessed.""" 
     cast(Callable[[str], object], getattr(cast(object, st), "subheader"))( 
-        "Sign in or create an account" 
-    )
+        "Sign in to continue" 
+    ) 
     cast(Callable[[str], object], getattr(cast(object, st), "caption"))( 
-        "Doctor registration creates a separate doctor-role account and records "
-        + "the professional details supplied during registration. This local app "
-        + "does not independently verify medical credentials with a licensing authority."
-    )
-
-    tabs = cast(_StreamlitTabsFactoryAPI, cast(object, st)).tabs(
-        ["Sign In", "Doctor Sign In", "Sign Up", "Doctor Sign Up"]
-    )
-
-    # --- Normal Sign In --------------------------------------------------
-    with tabs[0]:
-        with cast(_StreamlitFormFactoryAPI, cast(object, st)).form("sign_in_form"):
-            username = cast(Callable[..., str], getattr(cast(object, st), "text_input"))(
-                "Username", key="sign_in_username"
-            )
-            password = cast(Callable[..., str], getattr(cast(object, st), "text_input"))(
-                "Password", type="password", key="sign_in_password"
-            )
-            submitted = cast(Callable[..., bool], getattr(cast(object, st), "form_submit_button"))( 
-                "Sign In"
-            )
-
-        if submitted:
-            try:
-                user = user_store.authenticate(username, password)
-            except InvalidCredentialsError as exc:
-                _ = cast(_StreamlitErrorAPI, cast(object, st)).error(str(exc))
-            else:
-                session_state["logged_in_user"] = user.username
-                session_state["user_role"] = user.role
-                session_state["doctor_certificate_name"] = user.certificate_name
-                session_state["doctor_license_number"] = user.license_number
-                cast(Callable[[], object], getattr(cast(object, st), "rerun"))()
-
-    # --- Doctor Sign In --------------------------------------------------
-    with tabs[1]:
+        "Doctors can use the Doctor Sign In section to access the shared complaint " 
+        + "inbox after providing their professional certificate details." 
+    ) 
+ 
+    tabs = cast(_StreamlitTabsFactoryAPI, cast(object, st)).tabs( 
+        ["Sign In", "Doctor Sign In", "Sign Up"] 
+    ) 
+ 
+    # --- Sign In --------------------------------------------------------- 
+    with tabs[0]: 
+        with cast(_StreamlitFormFactoryAPI, cast(object, st)).form("sign_in_form"): 
+            sign_in_username = cast( 
+                Callable[..., str], getattr(cast(object, st), "text_input") 
+            )("Username", key="sign_in_username") 
+            sign_in_password = cast( 
+                Callable[..., str], getattr(cast(object, st), "text_input") 
+            )("Password", type="password", key="sign_in_password") 
+            sign_in_submitted = cast( 
+                Callable[..., bool], getattr(cast(object, st), "form_submit_button") 
+            )("Sign In") 
+ 
+        if sign_in_submitted: 
+            try: 
+                user = user_store.authenticate(sign_in_username, sign_in_password) 
+            except InvalidCredentialsError as exc: 
+                _ = cast(_StreamlitErrorAPI, cast(object, st)).error(str(exc)) 
+            else: 
+                session_state["logged_in_user"] = user.username 
+                session_state["user_role"] = "user" 
+                session_state["doctor_certificate_name"] = "" 
+                session_state["doctor_license_number"] = "" 
+                cast(Callable[[], object], getattr(cast(object, st), "rerun"))() 
+ 
+    # --- Doctor Sign In -------------------------------------------------- 
+    with tabs[1]: 
         cast(Callable[[str], object], getattr(cast(object, st), "info"))( 
-            "Existing doctor accounts can sign in here. The license number is "
-            + "checked against the number stored for the account."
-        )
-        with cast(_StreamlitFormFactoryAPI, cast(object, st)).form("doctor_sign_in_form"):
-            doctor_username = cast(Callable[..., str], getattr(cast(object, st), "text_input"))( 
-                "Username", key="doctor_sign_in_username"
-            )
-            doctor_password = cast(Callable[..., str], getattr(cast(object, st), "text_input"))( 
-                "Password", type="password", key="doctor_sign_in_password"
-            )
-            doctor_license = cast(Callable[..., str], getattr(cast(object, st), "text_input"))( 
-                "Medical license / certificate number", key="doctor_sign_in_license"
-            )
-            doctor_submitted = cast(Callable[..., bool], getattr(cast(object, st), "form_submit_button"))( 
-                "Doctor Sign In"
-            )
-
-        if doctor_submitted:
-            try:
-                user = user_store.authenticate(doctor_username, doctor_password)
-                if user.role != "doctor":
-                    raise InvalidCredentialsError("This account is not registered as a doctor account.")
-                if not secrets.compare_digest(doctor_license.strip(), user.license_number):
-                    raise InvalidCredentialsError("Incorrect doctor credentials.")
-            except InvalidCredentialsError as exc:
-                _ = cast(_StreamlitErrorAPI, cast(object, st)).error(str(exc))
-            else:
-                session_state["logged_in_user"] = user.username
-                session_state["user_role"] = "doctor"
-                session_state["doctor_certificate_name"] = user.certificate_name
-                session_state["doctor_license_number"] = user.license_number
-                _ = cast(_StreamlitSuccessAPI, cast(object, st)).success(
-                    "Doctor sign-in successful. Opening the patient-care workspace."
-                )
-                cast(Callable[[], object], getattr(cast(object, st), "rerun"))()
-
-    # --- Normal Sign Up --------------------------------------------------
-    with tabs[2]:
-        with cast(_StreamlitFormFactoryAPI, cast(object, st)).form("sign_up_form"):
-            sign_up_username = cast(Callable[..., str], getattr(cast(object, st), "text_input"))( 
-                "Choose a username", key="sign_up_username"
-            )
-            sign_up_password = cast(Callable[..., str], getattr(cast(object, st), "text_input"))( 
-                "Choose a password", type="password", key="sign_up_password"
-            )
-            sign_up_confirm = cast(Callable[..., str], getattr(cast(object, st), "text_input"))( 
-                "Confirm password", type="password", key="sign_up_confirm"
-            )
-            sign_up_submitted = cast(Callable[..., bool], getattr(cast(object, st), "form_submit_button"))( 
-                "Create Account"
-            )
-
-        if sign_up_submitted:
-            try:
-                user = user_store.register(sign_up_username, sign_up_password, sign_up_confirm)
-            except (InvalidCredentialsError, UsernameTakenError) as exc:
-                _ = cast(_StreamlitErrorAPI, cast(object, st)).error(str(exc))
-            else:
-                session_state["logged_in_user"] = user.username
-                session_state["user_role"] = "user"
-                session_state["doctor_certificate_name"] = ""
-                session_state["doctor_license_number"] = ""
-                _ = cast(_StreamlitSuccessAPI, cast(object, st)).success(
-                    f"Account created — welcome, {user.username}!"
-                )
-                cast(Callable[[], object], getattr(cast(object, st), "rerun"))()
-
-    # --- Doctor Sign Up --------------------------------------------------
-    with tabs[3]:
-        cast(Callable[[str], object], getattr(cast(object, st), "info"))( 
-            "Doctor registration requires your professional details and a "
-            + "certificate upload. The app stores the certificate filename and "
-            + "the details you provide, but it does not independently verify the "
-            + "credentials with a medical licensing authority."
-        )
-        with cast(_StreamlitFormFactoryAPI, cast(object, st)).form("doctor_sign_up_form"):
-            doctor_name = cast(Callable[..., str], getattr(cast(object, st), "text_input"))( 
-                "Full professional name", key="doctor_signup_name"
-            )
-            doctor_specialty = cast(Callable[..., str], getattr(cast(object, st), "text_input"))( 
-                "Medical specialty", placeholder="e.g. General Practice", key="doctor_signup_specialty"
-            )
-            doctor_license = cast(Callable[..., str], getattr(cast(object, st), "text_input"))( 
-                "Medical license / certificate number", key="doctor_signup_license"
-            )
-            doctor_username = cast(Callable[..., str], getattr(cast(object, st), "text_input"))( 
-                "Choose a doctor username", key="doctor_signup_username"
-            )
-            doctor_password = cast(Callable[..., str], getattr(cast(object, st), "text_input"))( 
-                "Choose a password", type="password", key="doctor_signup_password"
-            )
-            doctor_confirm = cast(Callable[..., str], getattr(cast(object, st), "text_input"))( 
-                "Confirm password", type="password", key="doctor_signup_confirm"
-            )
-            doctor_certificate = cast(Callable[..., object], getattr(cast(object, st), "file_uploader"))( 
-                "Upload professional certificate",
-                type=["pdf", "png", "jpg", "jpeg"],
-                key="doctor_signup_certificate",
-                help="PDF or image of the professional certificate. The local app records its filename; it does not verify the document."
-            )
-            doctor_signup_submitted = cast(Callable[..., bool], getattr(cast(object, st), "form_submit_button"))( 
-                "Create Doctor Account"
-            )
-
-        if doctor_signup_submitted:
-            certificate_name = str(getattr(doctor_certificate, "name", "")) if doctor_certificate else ""
-            try:
-                user = user_store.register_doctor(
-                    doctor_username,
-                    doctor_password,
-                    doctor_confirm,
-                    doctor_name,
-                    doctor_license,
-                    doctor_specialty,
-                    certificate_name,
-                )
-            except (InvalidCredentialsError, UsernameTakenError, DoctorRegistrationError) as exc:
-                _ = cast(_StreamlitErrorAPI, cast(object, st)).error(str(exc))
-            else:
-                session_state["logged_in_user"] = user.username
-                session_state["user_role"] = "doctor"
-                session_state["doctor_certificate_name"] = user.certificate_name
-                session_state["doctor_license_number"] = user.license_number
-                _ = cast(_StreamlitSuccessAPI, cast(object, st)).success(
-                    f"Doctor account created — welcome, Dr. {user.doctor_name}!"
-                )
-                cast(Callable[[], object], getattr(cast(object, st), "rerun"))()
-
-
+            "Doctor access is intended for licensed medical professionals. " 
+            + "Certificate upload is a credential-submission step; this local " 
+            + "app does not independently verify the certificate with a " 
+            + "medical licensing authority." 
+        ) 
+        with cast(_StreamlitFormFactoryAPI, cast(object, st)).form( 
+            "doctor_sign_in_form" 
+        ): 
+            doctor_username = cast( 
+                Callable[..., str], getattr(cast(object, st), "text_input") 
+            )("Username", key="doctor_sign_in_username") 
+            doctor_password = cast( 
+                Callable[..., str], getattr(cast(object, st), "text_input") 
+            )("Password", type="password", key="doctor_sign_in_password") 
+            doctor_license_number = cast( 
+                Callable[..., str], getattr(cast(object, st), "text_input") 
+            )("Medical license / certificate number", key="doctor_license_number") 
+            doctor_certificate = cast( 
+                Callable[..., object], getattr(cast(object, st), "file_uploader") 
+            )( 
+                "Upload medical certificate", 
+                type=["pdf", "png", "jpg", "jpeg"], 
+                key="doctor_certificate", 
+                help="Upload the professional certificate that supports your doctor access request.", 
+            ) 
+            doctor_submitted = cast( 
+                Callable[..., bool], getattr(cast(object, st), "form_submit_button") 
+            )("Doctor Sign In") 
+ 
+        if doctor_submitted: 
+            if not doctor_license_number.strip(): 
+                _ = cast(_StreamlitErrorAPI, cast(object, st)).error( 
+                    "Enter your medical license or certificate number." 
+                ) 
+            elif doctor_certificate is None: 
+                _ = cast(_StreamlitErrorAPI, cast(object, st)).error( 
+                    "Upload your medical certificate before accessing the app." 
+                ) 
+            else: 
+                try: 
+                    user = user_store.authenticate(doctor_username, doctor_password) 
+                except InvalidCredentialsError as exc: 
+                    _ = cast(_StreamlitErrorAPI, cast(object, st)).error(str(exc)) 
+                else: 
+                    session_state["logged_in_user"] = user.username 
+                    session_state["user_role"] = "doctor" 
+                    session_state["doctor_certificate_name"] = str( 
+                        getattr(doctor_certificate, "name", "certificate") 
+                    ) 
+                    session_state["doctor_license_number"] = doctor_license_number.strip()
+                    DoctorAvailabilityStore().set_online(
+                        user.username,
+                        doctor_license_number.strip(),
+                        str(getattr(doctor_certificate, "name", "certificate")),
+                    )
+                    _ = cast(_StreamlitSuccessAPI, cast(object, st)).success( 
+                        "Doctor credentials supplied. Opening the complaint inbox." 
+                    ) 
+                    cast(Callable[[], object], getattr(cast(object, st), "rerun"))() 
+ 
+    # --- Sign Up ----------------------------------------------------------- 
+    with tabs[2]: 
+        with cast(_StreamlitFormFactoryAPI, cast(object, st)).form("sign_up_form"): 
+            sign_up_username = cast( 
+                Callable[..., str], getattr(cast(object, st), "text_input") 
+            )("Choose a username", key="sign_up_username") 
+            sign_up_password = cast( 
+                Callable[..., str], getattr(cast(object, st), "text_input") 
+            )("Choose a password", type="password", key="sign_up_password") 
+            sign_up_confirm = cast( 
+                Callable[..., str], getattr(cast(object, st), "text_input") 
+            )("Confirm password", type="password", key="sign_up_confirm") 
+            sign_up_submitted = cast( 
+                Callable[..., bool], getattr(cast(object, st), "form_submit_button") 
+            )("Sign Up") 
+ 
+        if sign_up_submitted: 
+            try: 
+                user = user_store.register(sign_up_username, sign_up_password, sign_up_confirm) 
+            except (InvalidCredentialsError, UsernameTakenError) as exc: 
+                _ = cast(_StreamlitErrorAPI, cast(object, st)).error(str(exc)) 
+            else: 
+                session_state["logged_in_user"] = user.username 
+                session_state["user_role"] = "user" 
+                session_state["doctor_certificate_name"] = "" 
+                session_state["doctor_license_number"] = "" 
+                _ = cast(_StreamlitSuccessAPI, cast(object, st)).success( 
+                    f"Account created — welcome, {user.username}!" 
+                ) 
+                cast(Callable[[], object], getattr(cast(object, st), "rerun"))() 
+ 
+ 
 def render_search_tab(history: SearchHistory, session_state: dict[str, object], api_key: str) -> None: 
     """Render the drug-lookup search box, results, recall banner, and 
     AI-simplified label sections. This is the app's original main 
@@ -1651,97 +1525,266 @@ def render_chat_tab(chat_history: ChatHistory, api_key: str) -> None:
     chat_history.add("model", reply) 
  
  
-def render_doctor_care_tab( 
-    api_key: str, 
-    session_state: dict[str, object], 
-) -> None: 
-    """Render the doctor-only patient-care workspace. The AI response is 
-    informational support for a licensed professional and is not a diagnosis 
-    or a substitute for clinical judgment.""" 
-    cast(Callable[[str], object], getattr(cast(object, st), "subheader"))( 
-        "🩺 Doctor Patient-Care Workspace" 
-    ) 
-    cast(Callable[[str], object], getattr(cast(object, st), "caption"))( 
-        "Use the medication search and medical-question assistant as clinical " 
-        + "information support when attending to patients. Always use your " 
-        + "professional judgment and current clinical guidance." 
-    ) 
- 
-    license_number = str(session_state.get("doctor_license_number", "")) 
-    certificate_name = str(session_state.get("doctor_certificate_name", "")) 
-    cast(_StreamlitWriteAPI, cast(object, st)).write( 
-        f"**Medical credential:** {license_number}" 
-    ) 
-    cast(_StreamlitWriteAPI, cast(object, st)).write( 
-        f"**Certificate supplied:** {certificate_name or 'Not available'}" 
-    ) 
- 
-    cast(Callable[[str], object], getattr(cast(object, st), "divider"))() 
-    cast(Callable[[str], object], getattr(cast(object, st), "subheader"))( 
-        "Ask a medical question" 
-    ) 
-    cast(Callable[[str], object], getattr(cast(object, st), "caption"))( 
-        "Ask for general medical or medication information related to a patient. " 
-        + "Do not enter unnecessary patient-identifying information." 
-    ) 
- 
-    medical_question = cast( 
-        Callable[..., str], getattr(cast(object, st), "text_area") 
-    )( 
-        "Medical question", 
-        placeholder="Example: What are the common adverse effects and precautions for this medication?", 
-        key="doctor_medical_question", 
-    ) 
-    ask_question = cast( 
-        Callable[..., bool], getattr(cast(object, st), "button") 
-    )("Ask Medical Assistant", type="primary") 
- 
-    if not ask_question: 
-        return 
- 
-    if not medical_question.strip(): 
-        _ = cast(_StreamlitErrorAPI, cast(object, st)).error( 
-            "Enter a medical question first." 
-        ) 
-        return 
- 
-    if not api_key: 
-        _ = cast(_StreamlitErrorAPI, cast(object, st)).error( 
-            "Add a Gemini API key in the sidebar to use the medical assistant." 
-        ) 
-        return 
- 
-    prompt = ( 
-        "You are an informational medical assistant supporting a licensed " 
-        "healthcare professional. Provide concise, evidence-aware information " 
-        "about the question below. Do not claim to diagnose the patient, do not " 
-        "replace clinical judgment, and do not invent patient-specific facts. " 
-        "When the question requires urgent assessment, specialist review, or " 
-        "current local guidelines, clearly say so. Avoid unnecessary patient " 
-        "identifying information.\n\n" 
-        f"Medical question:\n{medical_question.strip()}" 
-    ) 
- 
-    translator = AITranslator(api_key=api_key) 
-    try: 
-        with cast(_StreamlitSpinnerFactoryAPI, cast(object, st)).spinner( 
-            "Preparing medical information..." 
-        ): 
-            reply = translator.chat(prompt, []) 
-    except AITranslationError as exc: 
-        reply = f"Sorry, I couldn't get a response right now: {exc}" 
- 
-    cast(Callable[[str], object], getattr(cast(object, st), "markdown"))( 
-        "**Medical Assistant Response**" 
-    ) 
-    cast(Callable[[str], object], getattr(cast(object, st), "markdown"))(reply) 
-    _ = cast(_StreamlitWarningAPI, cast(object, st)).warning( 
-        "AI-generated information is for clinical information support only. " 
-        + "It is not a diagnosis, prescription, or substitute for professional " 
-        + "clinical judgment or current medical guidance." 
-    ) 
- 
- 
+def render_patient_complaint_tab(
+    api_key: str,
+    session_state: dict[str, object],
+    complaints: ComplaintStore,
+    doctors: DoctorAvailabilityStore,
+) -> None:
+    """Let a patient submit a symptom complaint and route it to a doctor.
+
+    Gemini produces a cautious, non-diagnostic triage summary. The original
+    patient complaint is preserved for the doctor.
+    """
+    cast(Callable[[str], object], getattr(cast(object, st), "subheader"))(
+        "📝 Patient Complaint"
+    )
+    cast(Callable[[str], object], getattr(cast(object, st), "caption"))(
+        "Describe your symptoms or health concern. Your complaint can be routed "
+        "to an available doctor. Do not include passwords, payment details, or "
+        "other unnecessary personal information."
+    )
+
+    complaint_text = cast(
+        Callable[..., str], getattr(cast(object, st), "text_area")
+    )(
+        "What are you experiencing?",
+        placeholder=(
+            "Example: I have had a fever and sore throat since yesterday. "
+            "The fever is getting worse."
+        ),
+        height=180,
+        key="patient_complaint_text",
+    )
+
+    emergency_note = cast(
+        Callable[[str], object], getattr(cast(object, st), "warning")
+    )
+    emergency_note(
+        "If you have severe trouble breathing, severe chest pain, loss of "
+        "consciousness, uncontrolled bleeding, or another life-threatening "
+        "emergency, seek emergency medical care immediately instead of waiting "
+        "for a reply in this app."
+    )
+
+    submit = cast(
+        Callable[..., bool], getattr(cast(object, st), "button")
+    )("Send Complaint to an Available Doctor", type="primary")
+
+    if submit:
+        cleaned = complaint_text.strip()
+        if len(cleaned) < 10:
+            _ = cast(_StreamlitErrorAPI, cast(object, st)).error(
+                "Please describe the complaint in a little more detail."
+            )
+            return
+        if len(cleaned) > 5000:
+            _ = cast(_StreamlitErrorAPI, cast(object, st)).error(
+                "Please keep the complaint below 5,000 characters."
+            )
+            return
+        if not api_key:
+            _ = cast(_StreamlitErrorAPI, cast(object, st)).error(
+                "Add a Gemini API key in the sidebar to use the cloud-AI complaint assistant."
+            )
+            return
+
+        triage_prompt = (
+            "You are a cautious medical information triage assistant. "
+            "Review the patient's symptom complaint and create a short handoff "
+            "summary for a licensed doctor. Do NOT diagnose, prescribe, or state "
+            "that a disease is confirmed. Identify reported symptoms, duration "
+            "or severity if supplied, important missing information the doctor "
+            "may ask about, and whether the wording contains an obvious emergency "
+            "warning sign. If an emergency may be present, say that urgent medical "
+            "assessment is appropriate. Never invent facts.\n\n"
+            f"Patient complaint:\n{cleaned}"
+        )
+
+        translator = AITranslator(api_key=api_key)
+        try:
+            with cast(_StreamlitSpinnerFactoryAPI, cast(object, st)).spinner(
+                "Preparing your complaint for the doctor..."
+            ):
+                triage = translator.chat(triage_prompt, [])
+        except AITranslationError as exc:
+            _ = cast(_StreamlitErrorAPI, cast(object, st)).error(
+                f"Cloud AI could not prepare the complaint: {exc}"
+            )
+            return
+
+        patient_username = str(session_state.get("logged_in_user", ""))
+        record = complaints.create(patient_username, cleaned, triage)
+
+        # Automatically route to one currently available doctor.
+        assigned = doctors.assign_available_doctor(str(record["id"]), complaints)
+        if assigned:
+            _ = cast(_StreamlitSuccessAPI, cast(object, st)).success(
+                f"Complaint sent to available doctor: {assigned}."
+            )
+        else:
+            _ = cast(_StreamlitSuccessAPI, cast(object, st)).success(
+                "Complaint received. No doctor is currently marked available, "
+                "so it has been placed in the shared doctor queue."
+            )
+
+    cast(Callable[[str], object], getattr(cast(object, st), "divider"))()
+    cast(Callable[[str], object], getattr(cast(object, st), "subheader"))(
+        "My complaints"
+    )
+
+    patient_username = str(session_state.get("logged_in_user", ""))
+    mine = complaints.get_for_patient(patient_username)
+    if not mine:
+        cast(_StreamlitWriteAPI, cast(object, st)).write(
+            "You have not submitted a complaint yet."
+        )
+        return
+
+    for item in mine[:20]:
+        status = str(item.get("status", "waiting")).replace("_", " ").title()
+        created = str(item.get("created_at", ""))
+        with cast(_StreamlitExpanderFactoryAPI, cast(object, st)).expander(
+            f"{status} — {created}"
+        ):
+            cast(_StreamlitWriteAPI, cast(object, st)).write(
+                f"**Your complaint:** {item.get('complaint', '')}"
+            )
+            assigned = str(item.get("assigned_doctor", ""))
+            cast(_StreamlitWriteAPI, cast(object, st)).write(
+                f"**Doctor:** {assigned or 'Waiting for an available doctor'}"
+            )
+            if item.get("doctor_response"):
+                cast(_StreamlitWriteAPI, cast(object, st)).write(
+                    f"**Doctor response:** {item['doctor_response']}"
+                )
+            cast(_StreamlitWriteAPI, cast(object, st)).write(
+                "**AI handoff summary:**"
+            )
+            cast(Callable[[str], object], getattr(cast(object, st), "markdown"))(
+                str(item.get("triage", "No AI summary available."))
+            )
+
+
+def render_doctor_inbox_tab(
+    session_state: dict[str, object],
+    complaints: ComplaintStore,
+    doctors: DoctorAvailabilityStore,
+) -> None:
+    """Show doctors the shared patient complaint queue.
+
+    This replaces the former doctor patient-care workspace.
+    """
+    doctor_username = str(session_state.get("logged_in_user", ""))
+
+    cast(Callable[[str], object], getattr(cast(object, st), "subheader"))(
+        "📥 Doctor Complaint Inbox"
+    )
+    cast(Callable[[str], object], getattr(cast(object, st), "caption"))(
+        "Patient complaints are routed here. Review the patient's original "
+        "description, the AI-generated handoff summary, and respond using your "
+        "professional judgment."
+    )
+
+    available = doctors.available_doctors()
+    _ = cast(_StreamlitSuccessAPI, cast(object, st)).success(
+        f"{len(available)} doctor(s) currently marked available."
+    )
+
+    waiting = complaints.get_waiting()
+    assigned_to_me = complaints.get_for_doctor(doctor_username)
+
+    cast(Callable[[str], object], getattr(cast(object, st), "markdown"))(
+        f"**Waiting in queue:** {len(waiting)}  \n"
+        f"**Assigned to you:** {len(assigned_to_me)}"
+    )
+
+    if waiting:
+        cast(Callable[[str], object], getattr(cast(object, st), "divider"))()
+        cast(Callable[[str], object], getattr(cast(object, st), "subheader"))(
+            "Waiting complaints"
+        )
+        for item in waiting[:20]:
+            complaint_id = str(item.get("id", ""))
+            with cast(_StreamlitExpanderFactoryAPI, cast(object, st)).expander(
+                f"Complaint from {item.get('patient_username', 'patient')} — "
+                f"{item.get('created_at', '')}"
+            ):
+                cast(_StreamlitWriteAPI, cast(object, st)).write(
+                    f"**Patient complaint:** {item.get('complaint', '')}"
+                )
+                cast(_StreamlitWriteAPI, cast(object, st)).write(
+                    "**Cloud-AI handoff summary:**"
+                )
+                cast(Callable[[str], object], getattr(cast(object, st), "markdown"))(
+                    str(item.get("triage", "No AI summary available."))
+                )
+                if cast(
+                    Callable[..., bool], getattr(cast(object, st), "button")
+                )("Claim complaint", key=f"claim_{complaint_id}"):
+                    if complaints.claim(complaint_id, doctor_username):
+                        _ = cast(_StreamlitSuccessAPI, cast(object, st)).success(
+                            "Complaint claimed. Refreshing your inbox."
+                        )
+                        cast(Callable[[], object], getattr(cast(object, st), "rerun"))()
+                    else:
+                        _ = cast(_StreamlitErrorAPI, cast(object, st)).error(
+                            "This complaint was already claimed by another doctor."
+                        )
+
+    if assigned_to_me:
+        cast(Callable[[str], object], getattr(cast(object, st), "divider"))()
+        cast(Callable[[str], object], getattr(cast(object, st), "subheader"))(
+            "My assigned complaints"
+        )
+        for item in assigned_to_me[:20]:
+            complaint_id = str(item.get("id", ""))
+            with cast(_StreamlitExpanderFactoryAPI, cast(object, st)).expander(
+                f"{item.get('status', 'claimed').title()} — "
+                f"{item.get('created_at', '')}"
+            ):
+                cast(_StreamlitWriteAPI, cast(object, st)).write(
+                    f"**Patient complaint:** {item.get('complaint', '')}"
+                )
+                cast(_StreamlitWriteAPI, cast(object, st)).write(
+                    "**Cloud-AI handoff summary:**"
+                )
+                cast(Callable[[str], object], getattr(cast(object, st), "markdown"))(
+                    str(item.get("triage", "No AI summary available."))
+                )
+                response = cast(
+                    Callable[..., str], getattr(cast(object, st), "text_area")
+                )(
+                    "Response to patient",
+                    value=str(item.get("doctor_response", "")),
+                    key=f"response_{complaint_id}",
+                    height=140,
+                    placeholder=(
+                        "Provide appropriate medical guidance, explain when the "
+                        "patient should seek urgent care, and avoid claiming a "
+                        "diagnosis unless clinically established outside this app."
+                    ),
+                )
+                if cast(
+                    Callable[..., bool], getattr(cast(object, st), "button")
+                )("Send response to patient", key=f"send_response_{complaint_id}"):
+                    if complaints.respond(complaint_id, doctor_username, response):
+                        _ = cast(_StreamlitSuccessAPI, cast(object, st)).success(
+                            "Response sent to the patient."
+                        )
+                        cast(Callable[[], object], getattr(cast(object, st), "rerun"))()
+                    else:
+                        _ = cast(_StreamlitErrorAPI, cast(object, st)).error(
+                            "Could not send the response. Make sure you entered a response."
+                        )
+
+    _ = cast(_StreamlitWarningAPI, cast(object, st)).warning(
+        "The AI summary is not a diagnosis and may be incomplete. Doctors remain "
+        "responsible for clinical assessment, decisions, and emergency escalation."
+    )
+
+
+
 def render_profile_tab( 
     user: User, 
     search_entries: list[dict[str, object]], 
@@ -1755,15 +1798,6 @@ def render_profile_tab(
         f"**Member since:** {user.created_at or 'Unknown'}" 
     ) 
  
-    if user.role == "doctor":
-        cast(_StreamlitWriteAPI, cast(object, st)).write(
-            f"**Role:** Doctor\n\n"
-            f"**Professional name:** {user.doctor_name or 'Not provided'}\n\n"
-            f"**Specialty:** {user.specialty or 'Not provided'}\n\n"
-            f"**License / certificate number:** {user.license_number or 'Not provided'}\n\n"
-            f"**Certificate file:** {user.certificate_name or 'Not provided'}"
-        )
-
     stats = compute_profile_stats(search_entries) 
     columns_fn = cast(Callable[[int], list[object]], getattr(cast(object, st), "columns")) 
     metric_fn = cast(Callable[..., object], getattr(cast(object, st), "metric")) 
@@ -1814,7 +1848,7 @@ def main() -> None:
     ) 
     _ = cast(Callable[[str], object], getattr(cast(object, st), "caption"))( 
         "Look up medication information, check active recalls, or use the " 
-        + "doctor-only patient-care workspace for clinical information support." 
+        + "patient complaint service, or the doctor complaint inbox when signed in as a doctor." 
     ) 
  
     # --- Authentication gate --------------------------------------------- 
@@ -1862,6 +1896,8 @@ def main() -> None:
         if cast(Callable[[str], bool], getattr(cast(object, st), "button"))( 
             "Log out" 
         ): 
+            if session_state.get("user_role") == "doctor":
+                DoctorAvailabilityStore().set_offline(logged_in_user)
             session_state["logged_in_user"] = None 
             session_state["user_role"] = "user" 
             session_state["doctor_certificate_name"] = "" 
@@ -1900,29 +1936,41 @@ def main() -> None:
                 "No searches yet." 
             ) 
  
-    # --- Main content: Search / Doctor Care / Profile tabs --------------- 
-    if session_state.get("user_role") == "doctor": 
-        main_tabs = cast(_StreamlitTabsFactoryAPI, cast(object, st)).tabs( 
-            ["🔍 Medication Search", "🩺 Patient Care", "👤 Profile"] 
-        ) 
- 
-        with main_tabs[0]: 
-            render_search_tab(history, session_state, api_key) 
- 
-        with main_tabs[1]: 
-            render_doctor_care_tab(api_key, session_state) 
- 
-        profile_tab = main_tabs[2] 
-    else: 
-        main_tabs = cast(_StreamlitTabsFactoryAPI, cast(object, st)).tabs( 
-            ["🔍 Medication Search", "👤 Profile"] 
-        ) 
- 
-        with main_tabs[0]: 
-            render_search_tab(history, session_state, api_key) 
- 
-        profile_tab = main_tabs[1] 
- 
+    # --- Main content: patient complaint / doctor inbox / profile ----------
+    if session_state.get("user_role") == "doctor":
+        main_tabs = cast(_StreamlitTabsFactoryAPI, cast(object, st)).tabs(
+            ["🔍 Medication Search", "📥 Doctor Inbox", "👤 Profile"]
+        )
+
+        with main_tabs[0]:
+            render_search_tab(history, session_state, api_key)
+
+        with main_tabs[1]:
+            render_doctor_inbox_tab(
+                session_state,
+                ComplaintStore(),
+                DoctorAvailabilityStore(),
+            )
+
+        profile_tab = main_tabs[2]
+    else:
+        main_tabs = cast(_StreamlitTabsFactoryAPI, cast(object, st)).tabs(
+            ["🔍 Medication Search", "📝 Complaint", "👤 Profile"]
+        )
+
+        with main_tabs[0]:
+            render_search_tab(history, session_state, api_key)
+
+        with main_tabs[1]:
+            render_patient_complaint_tab(
+                api_key,
+                session_state,
+                ComplaintStore(),
+                DoctorAvailabilityStore(),
+            )
+
+        profile_tab = main_tabs[2]
+
     with profile_tab: 
         current_user = user_store.get_user(logged_in_user) 
         if current_user is None: 
@@ -1937,5 +1985,5 @@ def main() -> None:
             render_profile_tab(current_user, history.get_all(), user_store) 
  
  
-if __name__ == "__main__": 
-    main() 
+if __name__ == "__main__":
+    main()
