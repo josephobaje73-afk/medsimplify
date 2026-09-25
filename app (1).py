@@ -26,10 +26,12 @@ Environment variable required (or entered in the sidebar at runtime):
 
 from __future__ import annotations
 
+import hashlib
 import json
 import importlib
 import os
 import re
+import secrets
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -135,6 +137,32 @@ class _StreamlitSidebarAPI(Protocol):
         ...
 
 
+class _StreamlitFormAPI(Protocol):
+    def __enter__(self) -> "_StreamlitFormAPI":
+        ...
+
+    def __exit__(self, exc_type: object, exc_value: object, traceback: object) -> bool:
+        ...
+
+
+class _StreamlitFormFactoryAPI(Protocol):
+    def form(self, key: str, *, clear_on_submit: bool = ...) -> _StreamlitFormAPI:
+        ...
+
+
+class _StreamlitTabAPI(Protocol):
+    def __enter__(self) -> "_StreamlitTabAPI":
+        ...
+
+    def __exit__(self, exc_type: object, exc_value: object, traceback: object) -> bool:
+        ...
+
+
+class _StreamlitTabsFactoryAPI(Protocol):
+    def tabs(self, labels: list[str]) -> list[_StreamlitTabAPI]:
+        ...
+
+
 requests: ModuleType = importlib.import_module("requests")
 RequestException = cast(_RequestsModule, cast(object, requests)).exceptions.RequestException
 
@@ -183,6 +211,20 @@ class AITranslationError(MedSimplifyError):
 
 class ImageNotFoundError(MedSimplifyError):
     """Raised when no representative image could be found for a medication."""
+
+
+class AuthenticationError(MedSimplifyError):
+    """Base class for sign-up / sign-in failures."""
+
+
+class UsernameTakenError(AuthenticationError):
+    """Raised when registering a username that's already in use."""
+
+
+class InvalidCredentialsError(AuthenticationError):
+    """Raised for empty/too-short input, or a username/password that
+    doesn't match a stored account. Kept deliberately generic for
+    sign-in failures so we never reveal whether a username exists."""
 
 
 # ---------------------------------------------------------------------------
@@ -615,6 +657,134 @@ class ImageClient:
 
 
 # ---------------------------------------------------------------------------
+# User accounts (OOP + file handling + password security)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class User:
+    """A registered user account (never holds a plain-text password)."""
+
+    username: str
+    password_hash: str
+    salt: str
+    created_at: str
+
+
+class UserStore:
+    """Persists user accounts to a local JSON file. Passwords are never
+    stored in plain text: each one is salted with a random per-user value
+    and stretched through PBKDF2-HMAC-SHA256 before being written to disk,
+    and login compares hashes using a constant-time comparison to avoid
+    leaking timing information about how close a guess was."""
+
+    _HASH_ITERATIONS: ClassVar[int] = 200_000
+    _MIN_PASSWORD_LENGTH: ClassVar[int] = 8
+
+    def __init__(self, filepath: str = "users.json"):
+        self.filepath: Path = Path(filepath)
+        if not self.filepath.exists():
+            self._write({})
+
+    def _read(self) -> dict[str, dict[str, object]]:
+        try:
+            with self.filepath.open("r", encoding="utf-8") as f:
+                loaded = cast(object, json.load(f))
+        except (json.JSONDecodeError, FileNotFoundError):
+            return {}
+
+        if not isinstance(loaded, dict):
+            return {}
+
+        users: dict[str, dict[str, object]] = {}
+        for key, value in cast(dict[object, object], loaded).items():
+            if isinstance(key, str) and isinstance(value, dict):
+                users[key] = cast(dict[str, object], value)
+        return users
+
+    def _write(self, users: dict[str, dict[str, object]]) -> None:
+        with self.filepath.open("w", encoding="utf-8") as f:
+            json.dump(users, f, indent=2, ensure_ascii=False)
+
+    @staticmethod
+    def _hash_password(password: str, salt_hex: str) -> str:
+        """PBKDF2-HMAC-SHA256 the password against the given hex-encoded
+        salt. Deterministic for a given (password, salt) pair, which is
+        what lets sign-in re-derive and compare against the stored hash."""
+        digest = hashlib.pbkdf2_hmac(
+            "sha256",
+            password.encode("utf-8"),
+            bytes.fromhex(salt_hex),
+            UserStore._HASH_ITERATIONS,
+        )
+        return digest.hex()
+
+    def register(self, username: str, password: str, confirm_password: str) -> User:
+        """Create a new account. Raises InvalidCredentialsError on bad
+        input, or UsernameTakenError if the username is already in use."""
+        cleaned_username = username.strip()
+        if not cleaned_username:
+            raise InvalidCredentialsError("Username cannot be empty.")
+        if len(cleaned_username) > 50:
+            raise InvalidCredentialsError("Username is too long.")
+        if len(password) < self._MIN_PASSWORD_LENGTH:
+            raise InvalidCredentialsError(
+                f"Password must be at least {self._MIN_PASSWORD_LENGTH} characters long."
+            )
+        if password != confirm_password:
+            raise InvalidCredentialsError("Passwords do not match.")
+
+        users = self._read()
+        lookup_key = cleaned_username.lower()
+        if lookup_key in users:
+            raise UsernameTakenError(f'The username "{cleaned_username}" is already taken.')
+
+        salt_hex = secrets.token_hex(16)
+        password_hash = self._hash_password(password, salt_hex)
+        created_at = datetime.now().isoformat(timespec="seconds")
+
+        users[lookup_key] = {
+            "username": cleaned_username,
+            "password_hash": password_hash,
+            "salt": salt_hex,
+            "created_at": created_at,
+        }
+        self._write(users)
+
+        return User(
+            username=cleaned_username,
+            password_hash=password_hash,
+            salt=salt_hex,
+            created_at=created_at,
+        )
+
+    def authenticate(self, username: str, password: str) -> User:
+        """Verify credentials against a stored account. Raises
+        InvalidCredentialsError on any mismatch — deliberately the same
+        error whether the username doesn't exist or the password is
+        wrong, so a failed attempt never reveals which one was incorrect."""
+        users = self._read()
+        record = users.get(username.strip().lower())
+        if record is None:
+            raise InvalidCredentialsError("Incorrect username or password.")
+
+        stored_salt = record.get("salt")
+        stored_hash = record.get("password_hash")
+        if not isinstance(stored_salt, str) or not isinstance(stored_hash, str):
+            raise InvalidCredentialsError("Incorrect username or password.")
+
+        attempted_hash = self._hash_password(password, stored_salt)
+        if not secrets.compare_digest(attempted_hash, stored_hash):
+            raise InvalidCredentialsError("Incorrect username or password.")
+
+        return User(
+            username=str(record.get("username", username)),
+            password_hash=stored_hash,
+            salt=stored_salt,
+            created_at=str(record.get("created_at", "")),
+        )
+
+
+# ---------------------------------------------------------------------------
 # SearchHistory (OOP + file handling)
 # ---------------------------------------------------------------------------
 
@@ -705,6 +875,67 @@ def render_recall_banner(recalls: list[dict[str, str]]) -> None:
         )
 
 
+def render_auth_ui(user_store: UserStore, session_state: dict[str, object]) -> None:
+    """Render the sign-in / sign-up screen. On success, stores the
+    logged-in username in session_state and reruns the app so main()
+    picks up the logged-in branch on the next execution."""
+    cast(Callable[[str], object], getattr(cast(object, st), "subheader"))(
+        "Sign in to continue"
+    )
+
+    tabs = cast(_StreamlitTabsFactoryAPI, cast(object, st)).tabs(["Sign In", "Sign Up"])
+
+    # --- Sign In ---------------------------------------------------------
+    with tabs[0]:
+        with cast(_StreamlitFormFactoryAPI, cast(object, st)).form("sign_in_form"):
+            sign_in_username = cast(
+                Callable[..., str], getattr(cast(object, st), "text_input")
+            )("Username", key="sign_in_username")
+            sign_in_password = cast(
+                Callable[..., str], getattr(cast(object, st), "text_input")
+            )("Password", type="password", key="sign_in_password")
+            sign_in_submitted = cast(
+                Callable[..., bool], getattr(cast(object, st), "form_submit_button")
+            )("Sign In")
+
+        if sign_in_submitted:
+            try:
+                user = user_store.authenticate(sign_in_username, sign_in_password)
+            except InvalidCredentialsError as exc:
+                _ = cast(_StreamlitErrorAPI, cast(object, st)).error(str(exc))
+            else:
+                session_state["logged_in_user"] = user.username
+                cast(Callable[[], object], getattr(cast(object, st), "rerun"))()
+
+    # --- Sign Up -----------------------------------------------------------
+    with tabs[1]:
+        with cast(_StreamlitFormFactoryAPI, cast(object, st)).form("sign_up_form"):
+            sign_up_username = cast(
+                Callable[..., str], getattr(cast(object, st), "text_input")
+            )("Choose a username", key="sign_up_username")
+            sign_up_password = cast(
+                Callable[..., str], getattr(cast(object, st), "text_input")
+            )("Choose a password", type="password", key="sign_up_password")
+            sign_up_confirm = cast(
+                Callable[..., str], getattr(cast(object, st), "text_input")
+            )("Confirm password", type="password", key="sign_up_confirm")
+            sign_up_submitted = cast(
+                Callable[..., bool], getattr(cast(object, st), "form_submit_button")
+            )("Sign Up")
+
+        if sign_up_submitted:
+            try:
+                user = user_store.register(sign_up_username, sign_up_password, sign_up_confirm)
+            except (InvalidCredentialsError, UsernameTakenError) as exc:
+                _ = cast(_StreamlitErrorAPI, cast(object, st)).error(str(exc))
+            else:
+                session_state["logged_in_user"] = user.username
+                _ = cast(_StreamlitSuccessAPI, cast(object, st)).success(
+                    f"Account created — welcome, {user.username}!"
+                )
+                cast(Callable[[], object], getattr(cast(object, st), "rerun"))()
+
+
 def main() -> None:
     _ = cast(_StreamlitPageConfigAPI, cast(object, st)).set_page_config(
         page_title="MedSimplify", page_icon="💊", layout="centered"
@@ -717,14 +948,44 @@ def main() -> None:
         + "language, and check for active recalls."
     )
 
-    # --- Sidebar: API key + history ------------------------------------
+    # --- Authentication gate ---------------------------------------------
+    # FIX/NEW: everything below requires a signed-in user. session_state
+    # persists across Streamlit reruns (every click reruns the whole
+    # script), which is what lets a user stay "logged in" between actions.
+    session_state = cast(dict[str, object], getattr(cast(object, st), "session_state"))
+    if "logged_in_user" not in session_state:
+        session_state["logged_in_user"] = None
+
+    user_store = UserStore()
+
+    if not session_state.get("logged_in_user"):
+        render_auth_ui(user_store, session_state)
+        return
+
+    logged_in_user = cast(str, session_state["logged_in_user"])
+
+    # --- Sidebar: account + API key + history -----------------------------
     sidebar = cast(
         _StreamlitSidebarAPI,
         getattr(cast(object, st), "sidebar"),
     )
     api_key = ""
-    history = SearchHistory()
+    # NEW: each user's search history now lives in its own file, keyed by
+    # a lowercased/sanitized version of their username, so accounts don't
+    # share or overwrite each other's saved searches.
+    safe_username = re.sub(r"[^a-z0-9_-]", "_", logged_in_user.lower())
+    history = SearchHistory(filepath=f"search_history_{safe_username}.json")
     with sidebar:
+        _ = cast(Callable[[str], object], getattr(cast(object, st), "write"))(
+            f"👤 Signed in as **{logged_in_user}**"
+        )
+        if cast(Callable[[str], bool], getattr(cast(object, st), "button"))(
+            "Log out"
+        ):
+            session_state["logged_in_user"] = None
+            cast(Callable[[], object], getattr(cast(object, st), "rerun"))()
+
+        _ = cast(Callable[[], object], getattr(cast(object, st), "divider"))()
         _ = cast(Callable[[str], object], getattr(cast(object, st), "header"))(
             "Settings"
         )
@@ -801,7 +1062,7 @@ def main() -> None:
             # a plain object with no real `.info`, so this line silently
             # did nothing under the fallback. Routed through getattr like
             # the rest of the UI calls for consistency.
-            _ = cast(Callable[[str], object], getattr(cast(object, st), "info"))(
+            cast(Callable[[str], object], getattr(cast(object, st), "info"))(
                 "Note: the FDA label was missing data for: " + ", ".join(missing)
             )
 
@@ -814,14 +1075,15 @@ def main() -> None:
             )
             recalls = []
 
-    if medication is None:
-        return
-
-    _ = cast(Callable[[str], object], getattr(cast(object, st), "subheader"))(
-        f"{medication.generic_name.title() if medication.generic_name else drug_name.title()}"
+    # FIX: the original code had `if medication is None: return` *after*
+    # the code below already used `medication.generic_name` etc. Since
+    # both exception branches above already `return`, `medication` is
+    # guaranteed non-None here — removed the dead, misplaced check.
+    cast(Callable[[str], object], getattr(cast(object, st), "subheader"))(
+        f"{medication.generic_name.title() or drug_name.title()}"
     )
     if medication.brand_names:
-        _ = cast(Callable[[str], object], getattr(cast(object, st), "caption"))(
+        cast(Callable[[str], object], getattr(cast(object, st), "caption"))(
             "Brand names: " + ", ".join(medication.brand_names)
         )
 
@@ -829,13 +1091,13 @@ def main() -> None:
     image_client = ImageClient()
     try:
         image_url = image_client.fetch_thumbnail_url(medication, drug_name)
-        _ = cast(Callable[..., object], getattr(cast(object, st), "image"))(
+        cast(Callable[..., object], getattr(cast(object, st), "image"))(
             image_url,
             caption=f"Image of {medication.generic_name or drug_name}",
             width=300,
         )
     except ImageNotFoundError:
-        _ = cast(Callable[[str], object], getattr(cast(object, st), "caption"))(
+        cast(Callable[[str], object], getattr(cast(object, st), "caption"))(
             "No reference image available for this medication."
         )
 
@@ -843,7 +1105,7 @@ def main() -> None:
 
     keywords = medication.extract_warning_keywords()
     if keywords:
-        _ = cast(Callable[[str], object], getattr(cast(object, st), "markdown"))(
+        cast(Callable[[str], object], getattr(cast(object, st), "markdown"))(
             "**Key warning phrases (raw extract):**"
         )
         _ = cast(_StreamlitWriteAPI, cast(object, st)).write(
@@ -868,31 +1130,30 @@ def main() -> None:
             + "the simplified version."
         )
         for label, text in sections.items():
-            _ = markdown_fn(f"### {label}")
-            _ = write_fn.write(text or "_No data available._")
+            markdown_fn(f"### {label}")
+            write_fn.write(text or "_No data available._")
     else:
         translator = AITranslator(api_key=api_key)
         for label, text in sections.items():
-            _ = markdown_fn(f"### {label}")
-            simple_text = ""
+            markdown_fn(f"### {label}")
             try:
                 with cast(_StreamlitSpinnerFactoryAPI, cast(object, st)).spinner(
                     f"Simplifying '{label}'..."
                 ):
                     simple_text = translator.simplify(text, label)
-                _ = write_fn.write(simple_text)
+                write_fn.write(simple_text)
                 simplified[label] = simple_text
             except AITranslationError as exc:
                 _ = cast(_StreamlitErrorAPI, cast(object, st)).error(
                     f"Could not simplify this section: {exc}"
                 )
-                _ = write_fn.write(text or "_No data available._")
+                write_fn.write(text or "_No data available._")
             time.sleep(0.2)  # gentle pacing between API calls
 
     # 5. Save to history
     entry = build_entry(drug_name, medication, recalls, simplified)
     history.add(entry)
-    _ = cast(Callable[[str], object], getattr(cast(object, st), "toast"))(
+    cast(Callable[[str], object], getattr(cast(object, st), "toast"))(
         "Search saved to history."
     )
 
