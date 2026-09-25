@@ -1,5 +1,5 @@
 """
-MedSimplify — Plain-Language Drug Information App
+MedSimplify - Plain-Language Drug Information App
 ====================================================
 
 A Streamlit application that lets a user type a medication name and:
@@ -549,6 +549,9 @@ class AITranslator:
         "https://generativelanguage.googleapis.com/v1beta/models/"
         "{model}:generateContent"
     )
+    OPENAI_API_URL: str = (
+        "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
+    )
 
     # NEW: system-style framing prepended to every chat conversation, sent
     # as a fake first user/model turn since the generateContent endpoint
@@ -573,32 +576,92 @@ class AITranslator:
     def __init__(self, api_key: str, model: str = "gemini-3.8-flash"):
         if not api_key:
             raise AITranslationError("No Gemini API key was provided.")
-        self.api_key: str = api_key
+        self.api_key: str = api_key.strip().strip("\"'")
         self.model: str = model
+        self._response_mode: str = "native"
+
+    @staticmethod
+    def _to_openai_messages(contents: list[dict[str, object]]) -> list[dict[str, str]]:
+        """Convert Gemini generateContent turns to OpenAI-compatible messages."""
+        messages: list[dict[str, str]] = []
+        for item in contents:
+            role = str(item.get("role", "user"))
+            if role == "model":
+                role = "assistant"
+            parts = item.get("parts", [])
+            text_value = ""
+            if isinstance(parts, list) and parts:
+                first = parts[0]
+                if isinstance(first, dict):
+                    candidate = first.get("text")
+                    if isinstance(candidate, str):
+                        text_value = candidate
+            if text_value:
+                messages.append({"role": role, "content": text_value})
+        return messages
 
     def _post(self, contents: list[dict[str, object]]) -> _HTTPResponse:
-        """Shared low-level call to the Gemini generateContent endpoint."""
-        url = self.API_URL_TEMPLATE.format(model=self.model)
-        request_payload = {"contents": contents}
-        headers = {"Content-Type": "application/json"}
-        params = {"key": self.api_key}
+        """Call Gemini using native API-key auth, with a compatibility fallback.
+
+        Native generateContent uses x-goog-api-key. Some current AQ-format
+        authorization keys can return 401 on the native gateway; the official
+        OpenAI-compatible Gemini endpoint accepts the same key as a Bearer
+        token, so retry there only when native authentication is rejected.
+        """
+        native_url = self.API_URL_TEMPLATE.format(model=self.model)
+        headers = {
+            "Content-Type": "application/json",
+            "x-goog-api-key": self.api_key,
+        }
+        native_payload = {"contents": contents}
 
         try:
-            response: _HTTPResponse = cast(
-                Callable[..., _HTTPResponse],
-                requests.post,
-            )(
-                url, headers=headers, params=params,
-                data=json.dumps(request_payload), timeout=20,
+            response: _HTTPResponse = cast(Callable[..., _HTTPResponse], requests.post)(
+                native_url,
+                headers=headers,
+                data=json.dumps(native_payload),
+                timeout=20,
             )
         except RequestException as exc:
             raise AITranslationError(f"Could not reach Gemini API: {exc}") from exc
 
-        if not response.ok:
+        if response.ok:
+            self._response_mode = "native"
+            return response
+
+        if response.status_code != 401:
             raise AITranslationError(
-                f"Gemini API returned status {response.status_code}: {response.text[:200]}"
+                f"Gemini API returned status {response.status_code}: {response.text[:300]}"
             )
-        return response
+
+        # Fallback for current AQ/auth-key gateway compatibility issues.
+        openai_headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {self.api_key}",
+        }
+        openai_payload = {
+            "model": self.model,
+            "messages": self._to_openai_messages(contents),
+        }
+        try:
+            fallback: _HTTPResponse = cast(Callable[..., _HTTPResponse], requests.post)(
+                self.OPENAI_API_URL,
+                headers=openai_headers,
+                data=json.dumps(openai_payload),
+                timeout=20,
+            )
+        except RequestException as exc:
+            raise AITranslationError(f"Could not reach Gemini compatibility API: {exc}") from exc
+
+        if not fallback.ok:
+            raise AITranslationError(
+                "Gemini authentication failed on both API endpoints. "
+                f"Native: {response.status_code}; compatibility: "
+                f"{fallback.status_code}: {fallback.text[:250]}"
+            )
+
+        self._response_mode = "openai"
+        return fallback
 
     @staticmethod
     def _extract_text(response: _HTTPResponse) -> str:
@@ -615,6 +678,22 @@ class AITranslator:
             raise AITranslationError("Gemini API returned an unexpected response.")
 
         payload_dict = cast(dict[str, object], response_payload)
+
+        if self._response_mode == "openai":
+            choices = payload_dict.get("choices")
+            if not isinstance(choices, list) or not choices:
+                raise AITranslationError("Gemini compatibility API returned an unexpected response.")
+            first_choice = choices[0]
+            if not isinstance(first_choice, dict):
+                raise AITranslationError("Gemini compatibility API returned an unexpected response.")
+            message = first_choice.get("message")
+            if not isinstance(message, dict):
+                raise AITranslationError("Gemini compatibility API returned an unexpected response.")
+            text_value = message.get("content")
+            if not isinstance(text_value, str):
+                raise AITranslationError("Gemini compatibility API returned an unexpected response.")
+            return text_value.strip()
+
         candidates = payload_dict.get("candidates")
         if not isinstance(candidates, list) or not candidates:
             raise AITranslationError("Gemini API returned an unexpected response.")
@@ -2017,8 +2096,15 @@ def main() -> None:
         _StreamlitSidebarAPI, 
         getattr(cast(object, st), "sidebar"), 
     ) 
-    # Gemini API key supplied by the app owner.
-    api_key = "AQ.Ab8RN6JAAc-1v4q7FMHeTrI7k5lWJgwJfVf3qW4evvi_c_xmyg"
+    # Gemini API key: use Streamlit Secrets or the GEMINI_API_KEY environment variable.
+    # Do not hard-code a key in source code; keys exposed in source/chat may be revoked.
+    api_key = os.environ.get("GEMINI_API_KEY", "").strip()
+    try:
+        secret_key = st.secrets.get("GEMINI_API_KEY", "")
+        if isinstance(secret_key, str) and secret_key.strip():
+            api_key = secret_key.strip()
+    except Exception:
+        pass
     # Each user's search/chat history lives in its own file, keyed by a 
     # lowercased/sanitized version of their username, so accounts don't 
     # share or overwrite each other's saved data. 
