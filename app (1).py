@@ -937,38 +937,54 @@ def render_recall_banner(recalls: list[dict[str, str]]) -> None:
         )
 
 
+_SUGGESTION_PLACEHOLDER: str = "Did you mean…"
+
+
 def render_search_suggestions(session_state: dict[str, object], drug_name_input: str) -> None:
-    """Render clickable "did you mean" suggestions under the search box,
-    driven by FDAClient.suggest_names(). Clicking one fills the search
-    box with the exact FDA-recognized name and immediately triggers a
-    search, so the user doesn't have to click Search a second time."""
+    """Render a "did you mean" dropdown under the search box, driven by
+    FDAClient.suggest_names(). Picking an option fills the search box
+    with the exact FDA-recognized name and immediately triggers a
+    search, so the user doesn't have to click Search a second time.
+
+    The dropdown's widget key is derived from the current prefix
+    (`suggestion_select::<prefix>`) rather than a single fixed key.
+    Streamlit requires a selectbox's stored value to be one of its
+    current `options`, and the suggestion list changes on every
+    keystroke — a fixed key would raise once a previously-selected
+    option disappeared from a new options list. Keying per prefix
+    sidesteps that: each prefix gets its own fresh widget state, so
+    there's never a stale selection sitting outside the current options.
+    """
     cleaned = drug_name_input.strip()
     if len(cleaned) < 2:
         return
 
     suggestions = get_cached_suggestions(cleaned)
-    # Don't show a single suggestion that's just an exact echo of what's
+    # Don't show a suggestion that's just an exact echo of what's
     # already typed — that's not a useful "did you mean".
     suggestions = tuple(s for s in suggestions if s.lower() != cleaned.lower())
     if not suggestions:
         return
 
-    cast(Callable[[str], object], getattr(cast(object, st), "caption"))("Did you mean:")
-    columns = cast(
-        Callable[[int], list[object]], getattr(cast(object, st), "columns")
-    )(len(suggestions))
-    for column, suggestion in zip(columns, suggestions):
-        with cast(object, column):
-            clicked = cast(Callable[..., bool], getattr(cast(object, st), "button"))(
-                suggestion, key=f"suggest_{suggestion}"
-            )
-            if clicked:
-                # Setting these here, then rerunning, is what lets the
-                # text_input (bound to the same session_state key) pick
-                # up the chosen name on the next run and auto-search it.
-                session_state["drug_name_input"] = suggestion
-                session_state["trigger_search"] = True
-                cast(Callable[[], object], getattr(cast(object, st), "rerun"))()
+    dropdown_key = f"suggestion_select::{cleaned.lower()}"
+    options = [_SUGGESTION_PLACEHOLDER, *suggestions]
+
+    def _apply_selected_suggestion() -> None:
+        selected = cast(str, session_state.get(dropdown_key, _SUGGESTION_PLACEHOLDER))
+        if selected and selected != _SUGGESTION_PLACEHOLDER:
+            # Setting these here is what lets the text_input (bound to
+            # the same session_state key) pick up the chosen name on
+            # the rerun Streamlit already triggers after on_change, and
+            # auto-search it without a second click.
+            session_state["drug_name_input"] = selected
+            session_state["trigger_search"] = True
+
+    cast(Callable[..., object], getattr(cast(object, st), "selectbox"))(
+        "Did you mean:",
+        options,
+        key=dropdown_key,
+        on_change=_apply_selected_suggestion,
+    )
 
 
 def render_auth_ui(user_store: UserStore, session_state: dict[str, object]) -> None:
