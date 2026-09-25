@@ -1,4 +1,4 @@
-""
+"""
 MedSimplify — Plain-Language Drug Information App
 ====================================================
 
