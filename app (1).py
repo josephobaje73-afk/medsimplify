@@ -7,6 +7,8 @@ A Streamlit application that lets a user type a medication name and:
   2. Checks the openFDA Recall/Enforcement API for active recalls
   3. Uses the Gemini API to rewrite dense medical text into plain language
   4. Saves every search to a local JSON file so the user can revisit history
+  5. Offers live "did you mean" name suggestions while the user types,
+     powered by openFDA's cheap count-query mode
 
 Python concepts demonstrated (per assignment spec):
   - File handling      -> SearchHistory reads/writes a JSON file on disk
@@ -35,6 +37,7 @@ import secrets
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
+from functools import lru_cache
 from pathlib import Path
 from types import ModuleType
 from typing import Callable, ClassVar, Protocol, cast
@@ -427,6 +430,50 @@ class FDAClient:
             "No FDA label information found for "
             + f'"{drug_name}". Check the spelling or try the generic name.'
         )
+
+    def suggest_names(self, partial_name: str, limit: int = 8) -> list[str]:
+        """Return up to `limit` candidate generic/brand names starting with
+        the given partial text, for a "did you mean" search-as-you-type
+        experience. Uses openFDA's count-query mode, which returns matching
+        term/count pairs instead of full label records — much cheaper than
+        running a full fetch_label for every keystroke."""
+        cleaned = partial_name.strip()
+        if len(cleaned) < 2:
+            return []
+
+        suggestions: list[str] = []
+        seen_lower: set[str] = set()
+
+        for count_field in ("openfda.generic_name.exact", "openfda.brand_name.exact"):
+            query = f"{count_field}:{cleaned}*"
+            try:
+                data = self._get(
+                    self.LABEL_URL,
+                    {"search": query, "count": count_field, "limit": str(limit)},
+                )
+            except FDANetworkError:
+                # Suggestions are a nice-to-have, not core functionality —
+                # a transient failure here shouldn't block the user from
+                # typing a name and searching normally.
+                continue
+
+            results_value = data.get("results")
+            if not isinstance(results_value, list):
+                continue
+
+            for item in cast(list[object], results_value):
+                if not isinstance(item, dict):
+                    continue
+                item_dict = cast(dict[str, object], item)
+                term = item_dict.get("term")
+                if not isinstance(term, str):
+                    continue
+                normalized = term.strip().title()
+                if normalized and normalized.lower() not in seen_lower:
+                    seen_lower.add(normalized.lower())
+                    suggestions.append(normalized)
+
+        return suggestions[:limit]
 
     def fetch_recalls(self, drug_name: str, limit: int = 5) -> list[dict[str, str]]:
         """Return recent recall/enforcement records mentioning this drug."""
@@ -832,6 +879,21 @@ class SearchHistory:
 # Streamlit UI
 # ---------------------------------------------------------------------------
 
+@lru_cache(maxsize=256)
+def get_cached_suggestions(partial_name: str) -> tuple[str, ...]:
+    """Look up "did you mean" name suggestions for a partial medication
+    name, cached per unique prefix. Streamlit reruns the whole script on
+    every widget interaction, so without this cache the same prefix (e.g.
+    while the user is deciding whether to keep typing) would re-hit the
+    openFDA count endpoint on every rerun. Suggestions are best-effort:
+    any network problem here is swallowed rather than shown to the user,
+    since a failed suggestion lookup should never block a normal search."""
+    try:
+        return tuple(FDAClient().suggest_names(partial_name))
+    except FDANetworkError:
+        return ()
+
+
 def build_entry(
     drug_name: str,
     medication: Medication,
@@ -873,6 +935,40 @@ def render_recall_banner(recalls: list[dict[str, str]]) -> None:
         _ = cast(_StreamlitSuccessAPI, cast(object, st)).success(
             "✅ No recent recalls found for this medication."
         )
+
+
+def render_search_suggestions(session_state: dict[str, object], drug_name_input: str) -> None:
+    """Render clickable "did you mean" suggestions under the search box,
+    driven by FDAClient.suggest_names(). Clicking one fills the search
+    box with the exact FDA-recognized name and immediately triggers a
+    search, so the user doesn't have to click Search a second time."""
+    cleaned = drug_name_input.strip()
+    if len(cleaned) < 2:
+        return
+
+    suggestions = get_cached_suggestions(cleaned)
+    # Don't show a single suggestion that's just an exact echo of what's
+    # already typed — that's not a useful "did you mean".
+    suggestions = tuple(s for s in suggestions if s.lower() != cleaned.lower())
+    if not suggestions:
+        return
+
+    cast(Callable[[str], object], getattr(cast(object, st), "caption"))("Did you mean:")
+    columns = cast(
+        Callable[[int], list[object]], getattr(cast(object, st), "columns")
+    )(len(suggestions))
+    for column, suggestion in zip(columns, suggestions):
+        with cast(object, column):
+            clicked = cast(Callable[..., bool], getattr(cast(object, st), "button"))(
+                suggestion, key=f"suggest_{suggestion}"
+            )
+            if clicked:
+                # Setting these here, then rerunning, is what lets the
+                # text_input (bound to the same session_state key) pick
+                # up the chosen name on the next run and auto-search it.
+                session_state["drug_name_input"] = suggestion
+                session_state["trigger_search"] = True
+                cast(Callable[[], object], getattr(cast(object, st), "rerun"))()
 
 
 def render_auth_ui(user_store: UserStore, session_state: dict[str, object]) -> None:
@@ -1018,15 +1114,39 @@ def main() -> None:
             )
 
     # --- Main search form ------------------------------------------------
+    # NEW: bound to a session_state key (rather than a plain local var) so
+    # that clicking a suggestion below can programmatically set the box's
+    # value before the next rerun.
+    if "drug_name_input" not in session_state:
+        session_state["drug_name_input"] = ""
+    if "trigger_search" not in session_state:
+        session_state["trigger_search"] = False
+
     drug_name_input = cast(
         Callable[..., str], getattr(cast(object, st), "text_input")
-    )("Enter a medication name", placeholder="e.g. ibuprofen")
+    )(
+        "Enter a medication name",
+        placeholder="e.g. ibuprofen",
+        key="drug_name_input",
+    )
+
+    # NEW: live "did you mean" suggestions as the user types, powered by
+    # FDAClient.suggest_names(). Runs on every rerun (i.e. every
+    # keystroke that Streamlit picks up), but is cheap thanks to
+    # get_cached_suggestions() and openFDA's lightweight count-query mode.
+    render_search_suggestions(session_state, drug_name_input)
+
     search_clicked = cast(
         Callable[..., bool], getattr(cast(object, st), "button")
     )("Search", type="primary")
 
-    if not search_clicked:
+    if not (search_clicked or session_state.get("trigger_search")):
         return
+
+    # A suggestion click already consumed itself by setting this flag —
+    # reset it so a plain rerun later (e.g. clearing history) doesn't
+    # re-trigger a search on its own.
+    session_state["trigger_search"] = False
 
     # 1. Validate input
     try:
