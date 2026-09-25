@@ -1,4 +1,4 @@
-"""
+""
 MedSimplify — Plain-Language Drug Information App
 ====================================================
 
@@ -30,8 +30,7 @@ Complaint routing and doctor availability are persisted in shared JSON files; Ge
 Run with:
     streamlit run app.py
 
-Environment variable required (or entered in the sidebar at runtime):
-    GEMINI_API_KEY
+Gemini cloud AI is configured in the application code.
 """
 
 from __future__ import annotations
@@ -1347,7 +1346,7 @@ def render_auth_ui(user_store: UserStore, session_state: dict[str, object]) -> N
             )("Password", type="password", key="doctor_sign_in_password") 
             doctor_license_number = cast( 
                 Callable[..., str], getattr(cast(object, st), "text_input") 
-            )("Medical license / certificate number", key="doctor_license_number") 
+            )("Medical license / certificate number", key="doctor_sign_in_license_number") 
             doctor_certificate = cast( 
                 Callable[..., object], getattr(cast(object, st), "file_uploader") 
             )( 
@@ -2018,7 +2017,8 @@ def main() -> None:
         _StreamlitSidebarAPI, 
         getattr(cast(object, st), "sidebar"), 
     ) 
-    api_key = "" 
+    # Gemini API key supplied by the app owner.
+    api_key = "AQ.Ab8RN6JAAc-1v4q7FMHeTrI7k5lWJgwJfVf3qW4evvi_c_xmyg"
     # Each user's search/chat history lives in its own file, keyed by a 
     # lowercased/sanitized version of their username, so accounts don't 
     # share or overwrite each other's saved data. 
@@ -2045,15 +2045,12 @@ def main() -> None:
             cast(Callable[[], object], getattr(cast(object, st), "rerun"))() 
  
         _ = cast(Callable[[], object], getattr(cast(object, st), "divider"))() 
-        _ = cast(Callable[[str], object], getattr(cast(object, st), "header"))( 
+        _ = cast(Callable[[str,], object], getattr(cast(object, st), "header"))( 
             "Settings" 
         ) 
-        api_key = cast(Callable[..., str], getattr(cast(object, st), "text_input"))( 
-            "Gemini API Key", 
-            value=os.environ.get("GEMINI_API_KEY", ""), 
-            type="password", 
-            help="Get a key from Google AI Studio. Stored only for this session.", 
-        ) 
+        _ = cast(_StreamlitWriteAPI, cast(object, st)).write(
+            "🤖 Cloud AI is enabled."
+        )
  
         _ = cast(Callable[[], object], getattr(cast(object, st), "divider"))() 
         _ = cast(Callable[[str], object], getattr(cast(object, st), "header"))( 
